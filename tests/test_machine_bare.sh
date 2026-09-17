@@ -828,6 +828,74 @@ test_exec_interactive_large_stdin() {
 
 run_test "Exec: 'exec -i' streams 1 MiB of piped stdin (#926)" test_exec_interactive_large_stdin || true
 
+test_exec_interactive_stdin_before_eof() {
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+
+    local exit_code=0
+    # The timeout helper backgrounds Python, so pass the script as an argument.
+    run_with_timeout 90 python3 -c "$(cat <<'PY'
+import os
+import select
+import subprocess
+import sys
+import tempfile
+import time
+
+# Keep stdin open until every reply arrives. File redirection or communicate()
+# would send EOF, making the descriptor readable and hiding buffered-input stalls.
+with tempfile.TemporaryFile() as errors:
+    proc = subprocess.Popen(
+        [sys.argv[1], "machine", "exec", "--name", sys.argv[2], "-i", "--",
+         "sh", "-c", "printf 'ready\\n'; exec cat"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, bufsize=0,
+    )
+
+    def receive(expected):
+        actual = bytearray()
+        deadline = time.monotonic() + 10
+        while len(actual) < len(expected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([proc.stdout], [], [], remaining)[0]:
+                raise AssertionError(
+                    f"stdin stayed open: received {len(actual)} of {len(expected)} bytes"
+                )
+            chunk = os.read(proc.stdout.fileno(), len(expected) - len(actual))
+            if not chunk:
+                raise AssertionError("exec closed stdout before completing its reply")
+            actual.extend(chunk)
+        assert actual == expected, "stdin round-trip changed the payload"
+
+    try:
+        receive(b"ready\n")
+        # Cross the 4 KiB read boundary while keeping stdin open.
+        payload = b"x" * 4096 + b"\n"
+        pending = memoryview(payload)
+        while pending:
+            pending = pending[os.write(proc.stdin.fileno(), pending):]
+        receive(payload)
+        proc.stdin.close()
+        assert proc.wait(timeout=10) == 0, "exec failed after stdin EOF"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdin.close()
+        proc.stdout.close()
+        errors.seek(0)
+        sys.stderr.buffer.write(errors.read())
+PY
+)" "$SMOLVM" "$_EXEC_STDIN_MACHINE" || exit_code=$?
+
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    return "$exit_code"
+}
+
+run_test "Exec: interactive stdin round-trips before EOF" test_exec_interactive_stdin_before_eof || true
+
 test_exec_tty_piped_stdin_terminates() {
     # `--tty` runs the child on a PTY. A PTY cannot have one direction
     # closed, so when the feeding pipe (`echo`) closes, end-of-input must

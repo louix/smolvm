@@ -1968,6 +1968,20 @@ impl AgentClient {
 
         // Socket reads remain blocking; poll() determines read readiness.
         // Outbound frames are handled by FrameWriter.
+        // poll() observes the descriptor, not Rust's stdin read-ahead buffer.
+        // A buffered read can strand the end of a request until another write or
+        // EOF arrives, deadlocking clients that keep stdin open for the reply.
+        #[cfg(unix)]
+        let mut stdin_handle = {
+            use std::os::fd::AsFd;
+            std::fs::File::from(
+                stdin()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_err(|e| Error::agent("duplicate stdin", e.to_string()))?,
+            )
+        };
+        #[cfg(not(unix))]
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_raw_fd();
         let socket_fd = self.stream_raw_fd();
@@ -2058,7 +2072,11 @@ impl AgentClient {
                             data: stdin_buf[..n].to_vec(),
                         })?);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "stdin read error, treating as EOF");
                         stdin_eof = true;
